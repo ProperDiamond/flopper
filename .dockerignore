@@ -1,4 +1,6 @@
 .env
 .git
+.venv
 __pycache__/
 *.py[cod]
+fly.toml
