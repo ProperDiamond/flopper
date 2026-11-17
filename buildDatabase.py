@@ -43,7 +43,8 @@ EXTRA_WORKING_SPACE = re.compile(
     re.IGNORECASE,
 )
 QUESTION_PART_HEADER = re.compile(
-    r"^\s*\(([a-z]|[ivxlcdm]{2,}|\d+)\)(?=\s|$)", re.IGNORECASE
+    r"^\s*\(([a-z]|i{1,3}|iv|v|vi{0,3}|ix|x|\d+)\)(?=\s|$)",
+    re.IGNORECASE,
 )
 
 # Primary module and syllabus topic for each whole HSC question. These labels
