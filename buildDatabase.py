@@ -334,6 +334,13 @@ def question_images(
         })
         return part_order
 
+    def rename_part(part_order: int, label: str, path: tuple[str, ...]) -> None:
+        old_path = tuple(str(parts[part_order]["part_path"]).split())
+        paths.pop(old_path, None)
+        parts[part_order]["part_label"] = label
+        parts[part_order]["part_path"] = " ".join(path)
+        paths[path] = part_order
+
     def body_text_present(
         lines: list[dict[str, object]], top: float, bottom: float, page_width: float
     ) -> bool:
@@ -390,9 +397,18 @@ def question_images(
         boundaries: list[tuple[float, float, int | None]] = []
         for line_top, token in part_headers:
             subpart_header_top = max(top_pt, line_top - 5)
+            first_part_a = token == "a" and not saw_top_level_letter
             if subpart_header_top > cursor:
                 segment_part = active_part
-                if segment_part is None and (
+                if first_part_a:
+                    if segment_part is None:
+                        segment_part = add_part("(a)", None, ("(a)",))
+                        active_part = segment_part
+                    elif parts[segment_part]["part_label"] in {"Prompt", "Question"}:
+                        rename_part(segment_part, "(a)", ("(a)",))
+                    active_parent = segment_part
+                    saw_top_level_letter = True
+                elif segment_part is None and (
                     subpart_header_top - cursor >= 35
                     or body_text_present(
                         lines, cursor, subpart_header_top, float(page.width)
@@ -426,7 +442,19 @@ def question_images(
         if bottom_pt > cursor:
             boundaries.append((cursor, bottom_pt, active_part))
 
+        coalesced: list[tuple[float, float, int | None]] = []
         for top, bottom, part_order in boundaries:
+            if (
+                coalesced
+                and coalesced[-1][2] == part_order
+                and abs(coalesced[-1][1] - top) < 0.1
+            ):
+                previous_top, _, previous_part = coalesced[-1]
+                coalesced[-1] = (previous_top, bottom, previous_part)
+            else:
+                coalesced.append((top, bottom, part_order))
+
+        for top, bottom, part_order in coalesced:
             if part_order is None:
                 label = "Prompt" if part_headers else "Question"
                 part_order = add_part(label, None, (label,))
