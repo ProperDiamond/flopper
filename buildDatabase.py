@@ -37,6 +37,11 @@ END_OF_QUESTIONS = re.compile(
     r"^\s*(?:Formulae Sheet|Data Sheet|Periodic Table|Multiple Choice Answer Sheet)\b",
     re.IGNORECASE,
 )
+EXTRA_WORKING_SPACE = re.compile(
+    r"^\s*(?:(?:Section\s+(?:I|II)\s+)?extra\s+(?:writing|working)\s+space|"
+    r"if you use this space, clearly indicate which question you are answering)\b",
+    re.IGNORECASE,
+)
 
 # Primary module and syllabus topic for each whole HSC question. These labels
 # apply to the 2019–2024 Chemistry Stage 6 papers in this database.
@@ -111,27 +116,36 @@ def extract_questions(pdf_path: Path) -> dict[int, dict[str, object]]:
             return
         extracted[int(current["number"])] = current.copy()
 
-    for page_number, line in page_lines(pdf_path):
-        if current is not None and END_OF_QUESTIONS.match(line):
-            finish()
-            current = None
-            continue
-        match = QUESTION_HEADER.match(line)
-        if match and int(match.group(1)) >= 21:
-            number = int(match.group(1))
-            if current is not None and number == current["number"]:
-                current["end_page"] = page_number
-            else:
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            lines = (page.extract_text(layout=False) or "").splitlines()
+            if any(
+                END_OF_QUESTIONS.match(line) or EXTRA_WORKING_SPACE.match(line)
+                for line in lines
+            ):
                 finish()
-                mark_match = re.search(r"\((\d+)\s+marks?\)", match.group(2), re.IGNORECASE)
-                current = {
-                    "number": number,
-                    "start_page": page_number,
-                    "end_page": page_number,
-                    "marks": int(mark_match.group(1)) if mark_match else None,
-                }
-        elif current is not None:
-            current["end_page"] = page_number
+                current = None
+                continue
+
+            for line in lines:
+                match = QUESTION_HEADER.match(line)
+                if match and int(match.group(1)) >= 21:
+                    number = int(match.group(1))
+                    if current is not None and number == current["number"]:
+                        current["end_page"] = page_number
+                    else:
+                        finish()
+                        mark_match = re.search(
+                            r"\((\d+)\s+marks?\)", match.group(2), re.IGNORECASE
+                        )
+                        current = {
+                            "number": number,
+                            "start_page": page_number,
+                            "end_page": page_number,
+                            "marks": int(mark_match.group(1)) if mark_match else None,
+                        }
+                elif current is not None:
+                    current["end_page"] = page_number
 
     finish()
     return extracted
