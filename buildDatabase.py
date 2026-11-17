@@ -42,6 +42,9 @@ EXTRA_WORKING_SPACE = re.compile(
     r"if you use this space, clearly indicate which question you are answering)\b",
     re.IGNORECASE,
 )
+QUESTION_PART_HEADER = re.compile(
+    r"^\s*\(([a-z]|[ivxlcdm]{2,}|\d+)\)(?=\s|$)", re.IGNORECASE
+)
 
 # Primary module and syllabus topic for each whole HSC question. These labels
 # apply to the 2019–2024 Chemistry Stage 6 papers in this database.
@@ -116,21 +119,52 @@ def extract_questions(pdf_path: Path) -> dict[int, dict[str, object]]:
             return
         extracted[int(current["number"])] = current.copy()
 
+    def has_question_content(lines: list[dict[str, object]], page_width: float) -> bool:
+        text = " ".join(
+            str(line["text"])
+            for line in lines
+            if float(line["x0"]) >= 45
+            and float(line.get("x1", line["x0"])) <= page_width - 45
+        ).lower()
+        for pattern in (
+            r"office\s+use\s+only",
+            r"do\s+not\s+write\s+anything,?\s+or\s+make\s+any\s+marks\s+below\s+this\s+line",
+            r"do\s+not\s+write\s+in\s+this\s+area",
+            r"aera\s+siht\s+ni\s+etirw\s+ton\s+od",
+            r"please\s+turn\s+over",
+            r"end\s+of\s+paper",
+            r"question\s+\d+\s+continues\s+on\s+page\s+\d+",
+        ):
+            text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"[\W\d_]+", " ", text)
+        return bool(text.strip())
+
     with pdfplumber.open(pdf_path) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
-            lines = (page.extract_text(layout=False) or "").splitlines()
+            lines = sorted(
+                page.extract_text_lines() or [],
+                key=lambda line: (float(line["top"]), float(line["x0"])),
+            )
             if any(
-                END_OF_QUESTIONS.match(line) or EXTRA_WORKING_SPACE.match(line)
+                END_OF_QUESTIONS.match(str(line["text"]))
+                or EXTRA_WORKING_SPACE.match(str(line["text"]))
                 for line in lines
             ):
                 finish()
                 current = None
                 continue
 
+            pending_lines: list[dict[str, object]] = []
             for line in lines:
-                match = QUESTION_HEADER.match(line)
+                line_text = str(line["text"])
+                match = QUESTION_HEADER.match(line_text)
                 if match and int(match.group(1)) >= 21:
                     number = int(match.group(1))
+                    if current is not None and has_question_content(
+                        pending_lines, float(page.width)
+                    ):
+                        current["end_page"] = page_number
+                    pending_lines = []
                     if current is not None and number == current["number"]:
                         current["end_page"] = page_number
                     else:
@@ -145,7 +179,11 @@ def extract_questions(pdf_path: Path) -> dict[int, dict[str, object]]:
                             "marks": int(mark_match.group(1)) if mark_match else None,
                         }
                 elif current is not None:
-                    current["end_page"] = page_number
+                    pending_lines.append(line)
+            if current is not None and has_question_content(
+                pending_lines, float(page.width)
+            ):
+                current["end_page"] = page_number
 
     finish()
     return extracted
@@ -230,15 +268,29 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
            )"""
     )
     connection.execute("DROP TABLE IF EXISTS question_image_slices")
+    connection.execute("DROP TABLE IF EXISTS question_parts")
+    connection.execute(
+        """CREATE TABLE question_parts (
+             year INTEGER NOT NULL,
+             reference TEXT NOT NULL,
+             part_order INTEGER NOT NULL,
+             parent_order INTEGER,
+             part_label TEXT NOT NULL,
+             part_path TEXT NOT NULL,
+             PRIMARY KEY (year, reference, part_order)
+           )"""
+    )
     connection.execute(
         """CREATE TABLE question_image_slices (
              year INTEGER NOT NULL,
              reference TEXT NOT NULL,
+             part_order INTEGER NOT NULL,
+             part_label TEXT NOT NULL,
              page_number INTEGER NOT NULL,
              width INTEGER NOT NULL,
              height INTEGER NOT NULL,
              image_blob BLOB NOT NULL,
-             PRIMARY KEY (year, reference, page_number)
+             PRIMARY KEY (year, reference, part_order, page_number)
            )"""
     )
     ensure_mcq_schema(connection)
@@ -255,13 +307,50 @@ def topic_for_question(year: int, reference: str) -> str:
 
 def question_images(
     pdf: pdfplumber.PDF, question: dict[str, object]
-) -> list[tuple[bytes, int, int, int]]:
-    """Render each page section of a question as its own PNG image."""
+) -> list[dict[str, object]]:
+    """Render a question as an ordered tree of cropped prompt and subpart images."""
     number = int(question["number"])
     start_page = int(question["start_page"])
     end_page = int(question["end_page"])
-    slices: list[tuple[bytes, int, int, int]] = []
+    parts: list[dict[str, object]] = []
+    paths: dict[tuple[str, ...], int] = {}
+    active_part: int | None = None
+    active_parent: int | None = None
+    saw_top_level_letter = False
     resolution = 120
+
+    def add_part(label: str, parent_order: int | None, path: tuple[str, ...]) -> int:
+        if path in paths:
+            return paths[path]
+        part_order = len(parts)
+        paths[path] = part_order
+        parts.append({
+            "part_order": part_order,
+            "parent_order": parent_order,
+            "part_label": label,
+            "part_path": " ".join(path),
+            "images": [],
+        })
+        return part_order
+
+    def body_text_present(
+        lines: list[dict[str, object]], top: float, bottom: float, page_width: float
+    ) -> bool:
+        values = [
+            str(line["text"]).strip()
+            for line in lines
+            if top <= float(line["top"]) < bottom
+            and float(line["x0"]) >= 45
+            and float(line.get("x1", line["x0"])) <= page_width - 45
+        ]
+        text = " ".join(values).lower()
+        text = re.sub(r"question\s+\d+\s*(?:\([^)]*\))?", " ", text)
+        text = re.sub(r"question\s+\d+\s+continues\s+on\s+page\s+\d+", " ", text)
+        text = re.sub(r"office\s+use\s+only", " ", text)
+        text = re.sub(r"do\s+not\s+write[^.]*", " ", text)
+        text = re.sub(r"aera\s+siht\s+ni\s+etirw\s+ton\s+od", " ", text)
+        text = re.sub(r"[\W\d_]+", " ", text)
+        return bool(text.strip())
 
     for page_number in range(start_page, end_page + 1):
         page = pdf.pages[page_number - 1]
@@ -284,20 +373,82 @@ def question_images(
         top_pt = max(0.0, top_pt)
         bottom_pt = min(float(page.height), max(top_pt + 40, bottom_pt))
 
+        part_headers: list[tuple[float, str]] = []
+        for line in lines:
+            line_top = float(line["top"])
+            if not top_pt <= line_top < bottom_pt:
+                continue
+            match = QUESTION_PART_HEADER.match(str(line["text"]))
+            if match:
+                part_headers.append((line_top, match.group(1).lower()))
+        part_headers.sort(key=lambda part: part[0])
+
         rendered = page.to_image(resolution=resolution).original
         scale = resolution / 72
-        crop_box = (
-            0,
-            max(0, int(top_pt * scale)),
-            rendered.width,
-            min(rendered.height, int(bottom_pt * scale)),
-        )
-        crop = rendered.crop(crop_box).convert("RGB")
-        output = io.BytesIO()
-        crop.save(output, format="PNG", optimize=True)
-        slices.append((output.getvalue(), crop.width, crop.height, page_number))
+        cursor = top_pt
+        boundaries: list[tuple[float, float, int | None]] = []
+        for line_top, token in part_headers:
+            subpart_header_top = max(top_pt, line_top - 5)
+            if subpart_header_top > cursor:
+                segment_part = active_part
+                if segment_part is None and (
+                    subpart_header_top - cursor >= 35
+                    or body_text_present(
+                        lines, cursor, subpart_header_top, float(page.width)
+                    )
+                ):
+                    segment_part = add_part("Prompt", None, ("Prompt",))
+                boundaries.append((cursor, subpart_header_top, segment_part))
 
-    return slices
+            is_roman_subpart = token in {
+                "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"
+            }
+            if len(token) == 1 and token.isalpha() and not (
+                is_roman_subpart and saw_top_level_letter
+            ):
+                label = f"({token})"
+                active_parent = None
+                saw_top_level_letter = True
+                path = (label,)
+                active_part = add_part(label, None, path)
+            else:
+                label = f"({token})"
+                parent_order = active_parent if saw_top_level_letter else None
+                parent_path = next(
+                    (path for path, order in paths.items() if order == parent_order), ()
+                )
+                path = parent_path + (label,)
+                active_part = add_part(label, parent_order, path)
+            if active_part is not None and parts[active_part]["parent_order"] is None:
+                active_parent = active_part
+            cursor = subpart_header_top
+        if bottom_pt > cursor:
+            boundaries.append((cursor, bottom_pt, active_part))
+
+        for top, bottom, part_order in boundaries:
+            if part_order is None:
+                label = "Prompt" if part_headers else "Question"
+                part_order = add_part(label, None, (label,))
+                if not part_headers:
+                    active_part = part_order
+            if bottom - top < 35 and not body_text_present(
+                lines, top, bottom, float(page.width)
+            ):
+                continue
+            crop_box = (
+                0,
+                max(0, int(top * scale)),
+                rendered.width,
+                min(rendered.height, int(bottom * scale)),
+            )
+            crop = rendered.crop(crop_box).convert("RGB")
+            output = io.BytesIO()
+            crop.save(output, format="PNG", optimize=True)
+            parts[part_order]["images"].append(
+                (output.getvalue(), crop.width, crop.height, page_number)
+            )
+
+    return parts
 
 
 def ensure_mcq_schema(connection: sqlite3.Connection) -> None:
@@ -463,9 +614,18 @@ def import_year(connection: sqlite3.Connection, year: int, paper_name: str, guid
             topic_key = QUESTION_SYLLABUS[year][number]
             module_label = SYLLABUS_MODULES[topic_key]
             topic = SYLLABUS_TOPICS[topic_key]
-            image_slices = question_images(pdf, question)
-            first_image, width, height, _first_page = image_slices[0]
-            page_numbers = ",".join(str(page_number) for _, _, _, page_number in image_slices)
+            question_parts = question_images(pdf, question)
+            image_slices = [
+                (part, image)
+                for part in question_parts
+                for image in part["images"]
+            ]
+            first_part, first_slice = image_slices[0]
+            first_image, width, height, _first_page = first_slice
+            page_numbers = ",".join(
+                str(page_number)
+                for page_number in sorted({image[3] for _, image in image_slices})
+            )
             connection.execute(
             """INSERT INTO questions
                (year, reference, question_number, topic, pdf_page,
@@ -504,12 +664,39 @@ def import_year(connection: sqlite3.Connection, year: int, paper_name: str, guid
                 (year, reference, width, height, page_numbers, first_image, public_paper_url),
             )
             connection.executemany(
-                """INSERT INTO question_image_slices
-                   (year, reference, page_number, width, height, image_blob)
+                """INSERT INTO question_parts
+                   (year, reference, part_order, parent_order, part_label, part_path)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 [
-                    (year, reference, page_number, slice_width, slice_height, image_blob)
-                    for image_blob, slice_width, slice_height, page_number in image_slices
+                    (
+                        year,
+                        reference,
+                        part["part_order"],
+                        part["parent_order"],
+                        part["part_label"],
+                        part["part_path"],
+                    )
+                    for part in question_parts
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO question_image_slices
+                   (year, reference, part_order, part_label, page_number,
+                    width, height, image_blob)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        year,
+                        reference,
+                        part["part_order"],
+                        part["part_label"],
+                        page_number,
+                        slice_width,
+                        slice_height,
+                        image_blob,
+                    )
+                    for part, (image_blob, slice_width, slice_height, page_number)
+                    in image_slices
                 ],
             )
             imported += 1

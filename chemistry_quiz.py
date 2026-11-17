@@ -3,6 +3,7 @@
 import asyncio
 import io
 import random
+import re
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -246,7 +247,7 @@ async def play_mcq_race(channel: discord.TextChannel, rounds: int) -> int:
 
 def _random_question(module: str | None = None, topic: str | None = None) -> tuple[
     int, str, str, str, int | None, int | None, str | None, str | None,
-    list[tuple[int, bytes]], str, str,
+    list[tuple[int, str, int, bytes]], str, str,
 ]:
     with sqlite3.connect(DB_PATH) as connection:
         rows = connection.execute(
@@ -275,8 +276,13 @@ def _random_question(module: str | None = None, topic: str | None = None) -> tup
     try:
         with sqlite3.connect(DB_PATH) as connection:
             image_slices = connection.execute(
-                """SELECT page_number, image_blob FROM question_image_slices
-                   WHERE year = ? AND reference = ? ORDER BY page_number""",
+                """SELECT s.part_order, p.part_path, s.page_number, s.image_blob
+                   FROM question_image_slices AS s
+                   JOIN question_parts AS p
+                     ON p.year = s.year AND p.reference = s.reference
+                    AND p.part_order = s.part_order
+                   WHERE s.year = ? AND s.reference = ?
+                   ORDER BY s.part_order, s.page_number""",
                 (year, reference),
             ).fetchall()
     except sqlite3.OperationalError:
@@ -291,7 +297,14 @@ def _random_question(module: str | None = None, topic: str | None = None) -> tup
         if legacy_image:
             legacy_pages = (legacy_image[1] or "").split(",")
             image_slices = [
-                (int(legacy_pages[0]) if legacy_pages and legacy_pages[0] else (page or 1), legacy_image[0])
+                (
+                    0,
+                    "Question",
+                    int(legacy_pages[0])
+                    if legacy_pages and legacy_pages[0]
+                    else (page or 1),
+                    legacy_image[0],
+                )
             ]
     return (
         year, reference, topic, module_label, marks, page, guide_pages,
@@ -311,11 +324,16 @@ async def post_question(
     ) = _random_question(module, topic)
     safe_reference = reference.replace("(", "").replace(")", "")
     image_files = []
-    page_labels = []
-    for page_number, image_blob in image_slices:
-        filename = f"{year}_{safe_reference}_page_{page_number}.png"
+    part_labels = []
+    for part_order, part_path, page_number, image_blob in image_slices:
+        filename_label = re.sub(r"[^a-zA-Z0-9]+", "_", part_path).strip("_")
+        filename = (
+            f"{year}_{safe_reference}_{part_order + 1:02d}_"
+            f"{filename_label}_page_{page_number}.png"
+        )
         image_files.append(discord.File(io.BytesIO(image_blob), filename=filename))
-        page_labels.append(str(page_number))
+        if part_path not in part_labels:
+            part_labels.append(part_path)
     page_link = f"{pdf_url}#page={page}" if page else source_page
 
     embed = discord.Embed(
@@ -326,7 +344,7 @@ async def post_question(
     )
     embed.add_field(name="Topic", value=topic, inline=True)
     embed.add_field(name="Module", value=module_label, inline=False)
-    embed.add_field(name="Question pages", value=", ".join(page_labels), inline=True)
+    embed.add_field(name="Question parts", value=", ".join(part_labels), inline=True)
     embed.add_field(
         name="Original paper",
         value=f"[Open at page {page}]({page_link})" if page else f"[Open paper]({source_page})",
