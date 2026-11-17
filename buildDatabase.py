@@ -215,6 +215,18 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
              PRIMARY KEY (year, reference)
            )"""
     )
+    connection.execute("DROP TABLE IF EXISTS question_image_slices")
+    connection.execute(
+        """CREATE TABLE question_image_slices (
+             year INTEGER NOT NULL,
+             reference TEXT NOT NULL,
+             page_number INTEGER NOT NULL,
+             width INTEGER NOT NULL,
+             height INTEGER NOT NULL,
+             image_blob BLOB NOT NULL,
+             PRIMARY KEY (year, reference, page_number)
+           )"""
+    )
     ensure_mcq_schema(connection)
 
 
@@ -227,13 +239,14 @@ def topic_for_question(year: int, reference: str) -> str:
     return SYLLABUS_TOPICS.get(topic_key, "")
 
 
-def question_image(pdf: pdfplumber.PDF, question: dict[str, object]) -> tuple[bytes, int, int, str]:
-    """Render the question's page sections and join them into one PNG image."""
+def question_images(
+    pdf: pdfplumber.PDF, question: dict[str, object]
+) -> list[tuple[bytes, int, int, int]]:
+    """Render each page section of a question as its own PNG image."""
     number = int(question["number"])
     start_page = int(question["start_page"])
     end_page = int(question["end_page"])
-    crops: list[Image.Image] = []
-    page_numbers: list[int] = []
+    slices: list[tuple[bytes, int, int, int]] = []
     resolution = 120
 
     for page_number in range(start_page, end_page + 1):
@@ -265,19 +278,12 @@ def question_image(pdf: pdfplumber.PDF, question: dict[str, object]) -> tuple[by
             rendered.width,
             min(rendered.height, int(bottom_pt * scale)),
         )
-        crops.append(rendered.crop(crop_box).convert("RGB"))
-        page_numbers.append(page_number)
+        crop = rendered.crop(crop_box).convert("RGB")
+        output = io.BytesIO()
+        crop.save(output, format="PNG", optimize=True)
+        slices.append((output.getvalue(), crop.width, crop.height, page_number))
 
-    width = max(crop.width for crop in crops)
-    height = sum(crop.height for crop in crops)
-    combined = Image.new("RGB", (width, height), "white")
-    offset = 0
-    for crop in crops:
-        combined.paste(crop, (0, offset))
-        offset += crop.height
-    output = io.BytesIO()
-    combined.save(output, format="PNG", optimize=True)
-    return output.getvalue(), width, height, ",".join(map(str, page_numbers))
+    return slices
 
 
 def ensure_mcq_schema(connection: sqlite3.Connection) -> None:
@@ -443,7 +449,9 @@ def import_year(connection: sqlite3.Connection, year: int, paper_name: str, guid
             topic_key = QUESTION_SYLLABUS[year][number]
             module_label = SYLLABUS_MODULES[topic_key]
             topic = SYLLABUS_TOPICS[topic_key]
-            image_blob, width, height, page_numbers = question_image(pdf, question)
+            image_slices = question_images(pdf, question)
+            first_image, width, height, _first_page = image_slices[0]
+            page_numbers = ",".join(str(page_number) for _, _, _, page_number in image_slices)
             connection.execute(
             """INSERT INTO questions
                (year, reference, question_number, topic, pdf_page,
@@ -479,7 +487,16 @@ def import_year(connection: sqlite3.Connection, year: int, paper_name: str, guid
                    (year, reference, media_type, width, height, page_numbers,
                     image_blob, source_pdf_url)
                    VALUES (?, ?, 'image/png', ?, ?, ?, ?, ?)""",
-                (year, reference, width, height, page_numbers, image_blob, public_paper_url),
+                (year, reference, width, height, page_numbers, first_image, public_paper_url),
+            )
+            connection.executemany(
+                """INSERT INTO question_image_slices
+                   (year, reference, page_number, width, height, image_blob)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (year, reference, page_number, slice_width, slice_height, image_blob)
+                    for image_blob, slice_width, slice_height, page_number in image_slices
+                ],
             )
             imported += 1
 

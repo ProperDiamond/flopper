@@ -246,15 +246,14 @@ async def play_mcq_race(channel: discord.TextChannel, rounds: int) -> int:
 
 def _random_question(module: str | None = None, topic: str | None = None) -> tuple[
     int, str, str, str, int | None, int | None, str | None, str | None,
-    bytes, str, str,
+    list[tuple[int, bytes]], str, str,
 ]:
     with sqlite3.connect(DB_PATH) as connection:
         rows = connection.execute(
             """SELECT q.year, q.reference, q.topic, q.module,
                       q.marks, q.pdf_page,
                       q.marking_guide_pages, p.source_page_url, p.pdf_url,
-                      p.marking_pdf_url,
-                      i.image_blob
+                      p.marking_pdf_url
                FROM questions AS q
                JOIN papers AS p ON p.year = q.year
                JOIN question_images AS i
@@ -271,11 +270,32 @@ def _random_question(module: str | None = None, topic: str | None = None) -> tup
         raise LookupError("There are no question images in the database yet.")
     (
         year, reference, topic, module_label, marks, page, guide_pages,
-        source_page, pdf_url, marking_pdf_url, image_blob,
+        source_page, pdf_url, marking_pdf_url,
     ) = random.choice(rows)
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            image_slices = connection.execute(
+                """SELECT page_number, image_blob FROM question_image_slices
+                   WHERE year = ? AND reference = ? ORDER BY page_number""",
+                (year, reference),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        image_slices = []
+    if not image_slices:
+        with sqlite3.connect(DB_PATH) as connection:
+            legacy_image = connection.execute(
+                """SELECT image_blob, page_numbers FROM question_images
+                   WHERE year = ? AND reference = ?""",
+                (year, reference),
+            ).fetchone()
+        if legacy_image:
+            legacy_pages = (legacy_image[1] or "").split(",")
+            image_slices = [
+                (int(legacy_pages[0]) if legacy_pages and legacy_pages[0] else (page or 1), legacy_image[0])
+            ]
     return (
         year, reference, topic, module_label, marks, page, guide_pages,
-        marking_pdf_url, image_blob, source_page, pdf_url,
+        marking_pdf_url, image_slices, source_page, pdf_url,
     )
 
 
@@ -287,10 +307,15 @@ async def post_question(
     """Post an image question and start its public discussion thread."""
     (
         year, reference, topic, module_label, marks, page, guide_pages,
-        marking_pdf_url, image_blob, source_page, pdf_url,
+        marking_pdf_url, image_slices, source_page, pdf_url,
     ) = _random_question(module, topic)
     safe_reference = reference.replace("(", "").replace(")", "")
-    filename = f"{year}_{safe_reference}.png"
+    image_files = []
+    page_labels = []
+    for page_number, image_blob in image_slices:
+        filename = f"{year}_{safe_reference}_page_{page_number}.png"
+        image_files.append(discord.File(io.BytesIO(image_blob), filename=filename))
+        page_labels.append(str(page_number))
     page_link = f"{pdf_url}#page={page}" if page else source_page
 
     embed = discord.Embed(
@@ -299,9 +324,9 @@ async def post_question(
         if marks
         else "Discuss your working in the thread below.",
     )
-    embed.set_image(url=f"attachment://{filename}")
     embed.add_field(name="Topic", value=topic, inline=True)
     embed.add_field(name="Module", value=module_label, inline=False)
+    embed.add_field(name="Question pages", value=", ".join(page_labels), inline=True)
     embed.add_field(
         name="Original paper",
         value=f"[Open at page {page}]({page_link})" if page else f"[Open paper]({source_page})",
@@ -320,8 +345,7 @@ async def post_question(
             inline=True,
         )
 
-    image_file = discord.File(io.BytesIO(image_blob), filename=filename)
-    message = await channel.send(embed=embed, file=image_file)
+    message = await channel.send(embed=embed, files=image_files)
     try:
         thread = await message.create_thread(
             name=f"Chemistry question — {year} {reference}"[:100],
